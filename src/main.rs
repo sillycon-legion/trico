@@ -103,7 +103,8 @@ struct Fork {
     token: String,
     manifest_url: String,
     storage_path: RwLock<PathBuf>,
-    current_version: String,
+    current_hash: RwLock<[u8; 32]>,
+    current_version: RwLock<String>,
     update_subscriber: watch::Receiver<()>,
     update_notifier: watch::Sender<()>,
 }
@@ -161,7 +162,8 @@ impl ForkManager {
                     token: fork.token.clone(),
                     manifest_url: fork.manifest_url.clone(),
                     storage_path: RwLock::new(file),
-                    current_version: latest_id.clone(),
+                    current_hash: RwLock::new(artifact.sha256),
+                    current_version: RwLock::new(latest_id.clone()),
                     update_subscriber: recv,
                     update_notifier: send,
                 },
@@ -189,7 +191,7 @@ impl ForkManager {
             .server
             .get(PLATFORM)
             .ok_or(eyre!("Fork {id} has no versions for our platform!"))?;
-        if latest_id == &fork.current_version {
+        if *latest_id == *fork.current_version.read().await {
             return Ok(());
         }
         let path = fork.storage_path.write().await;
@@ -203,20 +205,27 @@ impl ForkManager {
         while let Some(chunk) = resp.chunk().await? {
             file.write_all(&chunk).await?;
         }
+        *fork.current_hash.write().await = artifact.sha256;
+        *fork.current_version.write().await = latest_id.clone();
         drop(path);
         _ = fork.update_notifier.send(());
         Ok(())
     }
 
     async fn extract_to(&self, id: &str, dest: &std::path::Path) -> Result<()> {
+        let fork = self.forks.get(id).ok_or(eyre!("Invalid fork!"))?;
+        let path = fork.storage_path.read().await;
+        if let Ok(hash) = tokio::fs::read(dest.join("installed")).await {
+            if fork.current_hash.read().await.as_slice() == hash {
+                return Ok(());
+            }
+        }
         if let Err(e) = tokio::fs::remove_dir_all(&dest).await {
             if e.kind() != ErrorKind::NotFound {
                 return Err(e.into());
             }
         }
         tokio::fs::create_dir_all(&dest).await?;
-        let fork = self.forks.get(id).ok_or(eyre!("Invalid fork!"))?;
-        let path = fork.storage_path.read().await;
         let zip = Arc::new(RandomAccessFile::open(path.as_path())?);
         let zip = zip.read_zip().await?;
         for entry in zip.entries() {
@@ -234,6 +243,11 @@ impl ForkManager {
             let mut file = tokio::fs::File::create(&path).await?;
             tokio::io::copy(&mut reader, &mut file).await?;
         }
+        tokio::fs::write(
+            dest.join("installed"),
+            fork.current_hash.read().await.as_slice(),
+        )
+        .await?;
         drop(path);
         Ok(())
     }
