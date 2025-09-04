@@ -17,6 +17,7 @@ rand = "0.9.2"
 rc-zip-tokio = "4.2.7"
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "charset", "http2", "rustls-tls"] }
 serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
 sha2 = "0.10.9"
 tokio = { version = "1.47.1", features = ["fs", "macros", "process", "rt-multi-thread"] }
 toml_edit = { version = "0.23.4", features = ["serde"] }

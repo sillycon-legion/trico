@@ -1,12 +1,26 @@
 use std::{
-    collections::HashMap, ffi::OsStr, io::ErrorKind, path::PathBuf, process::{ExitStatus, Stdio}, sync::Arc, time::Duration
+    collections::HashMap,
+    ffi::OsStr,
+    io::ErrorKind,
+    path::PathBuf,
+    process::{ExitStatus, Stdio},
+    sync::Arc,
+    time::Duration,
 };
 
 #[cfg(not(target_os = "windows"))]
 use std::os::unix::fs::PermissionsExt;
 
-use axum::{extract::{Path, State}, response::ErrorResponse, routing::{get, post}, Router};
-use axum_extra::{headers::{authorization::Basic, Authorization}, TypedHeader};
+use axum::{
+    Router,
+    extract::{Path, State},
+    response::ErrorResponse,
+    routing::post,
+};
+use axum_extra::{
+    TypedHeader,
+    headers::{Authorization, authorization::Basic},
+};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use constant_time_eq::constant_time_eq;
@@ -21,7 +35,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufWriter},
     process::Command,
-    sync::{mpsc, watch, RwLock},
+    sync::{RwLock, mpsc, watch},
     time::Instant,
 };
 use toml_edit::DocumentMut;
@@ -39,7 +53,10 @@ const PLATFORM: &str = "osx-arm64";
 const PLATFORM: &str = "windows-x64";
 #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
 const PLATFORM: &str = "windows-arm64";
-#[cfg(not(all(any(target_os = "windows", target_os = "macos", target_os = "linux"), any(target_arch = "x86_64", target_arch = "aarch64"))))]
+#[cfg(not(all(
+    any(target_os = "windows", target_os = "macos", target_os = "linux"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 const PLATFORM: &str = compile_error!("Unsupported platform!");
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -280,6 +297,7 @@ impl InstanceManager {
                 notifier: send,
             });
             tokio::spawn(Self::run_instance(
+                config.notifications.discord_webhook.clone(),
                 fork_manager,
                 config.base_url.clone(),
                 id.clone(),
@@ -293,7 +311,9 @@ impl InstanceManager {
         Ok(Self { instances })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_instance(
+        discord_webhook: Option<String>,
         fork_manager: &'static ForkManager,
         base_url: String,
         instance_id: String,
@@ -322,7 +342,24 @@ impl InstanceManager {
                     }
                 },
                 Ok(false) => continue,
-                Err(e) => error!("Restarting instance {instance_id}: {e:?}"),
+                Err(e) => {
+                    error!("Restarting instance {instance_id}: {e:?}");
+                    if let Some(webhook) = &discord_webhook {
+                        if let Err(e) = client
+                            .post(webhook)
+                            .json(&serde_json::json!({
+                                "content": format!("Instance {instance_id} (probably) crashed: {e:#}")
+                            }))
+                            .send()
+                            .await
+                            .and_then(|resp| resp.error_for_status()) {
+                                warn!(
+                                    "Failed to notify crash of instance {}: {e:?}",
+                                    instance.name
+                                );
+                            }
+                    }
+                }
             }
         }
     }
@@ -426,7 +463,8 @@ impl InstanceManager {
                 }
                 CommandOrExitOrUpdateOrTimeout::Command(Some(InstanceMessage::Ping)) => {
                     if waiting_for_exit != WaitingForExitType::Kill {
-                        timeout = Instant::now() + Duration::from_secs_f64(instance.timeout_seconds);
+                        timeout =
+                            Instant::now() + Duration::from_secs_f64(instance.timeout_seconds);
                     }
                 }
                 CommandOrExitOrUpdateOrTimeout::Command(Some(InstanceMessage::ForkChanged)) => {
@@ -502,7 +540,9 @@ async fn main() -> Result<()> {
         .route("/instances/{key}/update", post(fork_update))
         .with_state(AppState {
             fork_manager,
-            instance_manager: Box::leak(Box::new(InstanceManager::new(fork_manager, &config).await?)),
+            instance_manager: Box::leak(Box::new(
+                InstanceManager::new(fork_manager, &config).await?,
+            )),
             config_file: Box::leak(Box::new(args.config_file)),
         });
 
@@ -517,15 +557,21 @@ async fn server_ping(
     TypedHeader(Authorization(creds)): TypedHeader<Authorization<Basic>>,
 ) -> Result<(), ErrorResponse> {
     if creds.username() != key {
-        return Err(StatusCode::FORBIDDEN.into())
+        return Err(StatusCode::FORBIDDEN.into());
     }
     let Some(instance) = state.instance_manager.instances.get(&key) else {
-        return Err(StatusCode::NOT_FOUND.into())
+        return Err(StatusCode::NOT_FOUND.into());
     };
-    if !constant_time_eq(creds.password().as_bytes(), instance.internal_token.lock().as_bytes()) {
-        return Err(StatusCode::UNAUTHORIZED.into())
+    if !constant_time_eq(
+        creds.password().as_bytes(),
+        instance.internal_token.lock().as_bytes(),
+    ) {
+        return Err(StatusCode::UNAUTHORIZED.into());
     }
-    instance.notifier.send(InstanceMessage::Ping).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    instance
+        .notifier
+        .send(InstanceMessage::Ping)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(())
 }
 
@@ -535,15 +581,18 @@ async fn server_restart(
     TypedHeader(Authorization(creds)): TypedHeader<Authorization<Basic>>,
 ) -> Result<(), ErrorResponse> {
     if creds.username() != key {
-        return Err(StatusCode::FORBIDDEN.into())
+        return Err(StatusCode::FORBIDDEN.into());
     }
     let Some(instance) = state.instance_manager.instances.get(&key) else {
-        return Err(StatusCode::NOT_FOUND.into())
+        return Err(StatusCode::NOT_FOUND.into());
     };
     if !constant_time_eq(creds.password().as_bytes(), instance.token.as_bytes()) {
-        return Err(StatusCode::UNAUTHORIZED.into())
+        return Err(StatusCode::UNAUTHORIZED.into());
     }
-    instance.notifier.send(InstanceMessage::Restart).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    instance
+        .notifier
+        .send(InstanceMessage::Restart)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(())
 }
 
@@ -553,15 +602,18 @@ async fn server_stop(
     TypedHeader(Authorization(creds)): TypedHeader<Authorization<Basic>>,
 ) -> Result<(), ErrorResponse> {
     if creds.username() != key {
-        return Err(StatusCode::FORBIDDEN.into())
+        return Err(StatusCode::FORBIDDEN.into());
     }
     let Some(instance) = state.instance_manager.instances.get(&key) else {
-        return Err(StatusCode::NOT_FOUND.into())
+        return Err(StatusCode::NOT_FOUND.into());
     };
     if !constant_time_eq(creds.password().as_bytes(), instance.token.as_bytes()) {
-        return Err(StatusCode::UNAUTHORIZED.into())
+        return Err(StatusCode::UNAUTHORIZED.into());
     }
-    instance.notifier.send(InstanceMessage::Stop).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    instance
+        .notifier
+        .send(InstanceMessage::Stop)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(())
 }
 
@@ -571,20 +623,29 @@ async fn server_set_fork(
     TypedHeader(Authorization(creds)): TypedHeader<Authorization<Basic>>,
 ) -> Result<(), ErrorResponse> {
     if creds.username() != key {
-        return Err(StatusCode::FORBIDDEN.into())
+        return Err(StatusCode::FORBIDDEN.into());
     }
     let Some(instance) = state.instance_manager.instances.get(&key) else {
-        return Err(StatusCode::NOT_FOUND.into())
+        return Err(StatusCode::NOT_FOUND.into());
     };
     if !constant_time_eq(creds.password().as_bytes(), instance.token.as_bytes()) {
-        return Err(StatusCode::UNAUTHORIZED.into())
+        return Err(StatusCode::UNAUTHORIZED.into());
     }
-    let config_file = tokio::fs::read_to_string(&state.config_file).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut config: DocumentMut = config_file.parse().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let config_file = tokio::fs::read_to_string(&state.config_file)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut config: DocumentMut = config_file
+        .parse()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     config["instances"][&key]["fork"] = fork.as_str().into();
-    tokio::fs::write(&state.config_file, config.to_string()).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tokio::fs::write(&state.config_file, config.to_string())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     *instance.fork.lock() = fork;
-    instance.notifier.send(InstanceMessage::ForkChanged).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    instance
+        .notifier
+        .send(InstanceMessage::ForkChanged)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(())
 }
 
@@ -594,14 +655,18 @@ async fn fork_update(
     TypedHeader(Authorization(creds)): TypedHeader<Authorization<Basic>>,
 ) -> Result<(), ErrorResponse> {
     if creds.username() != key {
-        return Err(StatusCode::FORBIDDEN.into())
+        return Err(StatusCode::FORBIDDEN.into());
     }
     let Some(fork) = state.fork_manager.forks.get(&key) else {
-        return Err(StatusCode::NOT_FOUND.into())
+        return Err(StatusCode::NOT_FOUND.into());
     };
     if !constant_time_eq(creds.password().as_bytes(), fork.token.as_bytes()) {
-        return Err(StatusCode::UNAUTHORIZED.into())
+        return Err(StatusCode::UNAUTHORIZED.into());
     }
-    state.fork_manager.check_update(&key).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state
+        .fork_manager
+        .check_update(&key)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(())
 }

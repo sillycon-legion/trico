@@ -2046,6 +2046,7 @@ dependencies = [
  "rc-zip-tokio",
  "reqwest",
  "serde",
+ "serde_json",
  "sha2",
  "tokio",
  "toml_edit 0.23.4",
