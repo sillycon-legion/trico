@@ -36,6 +36,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufWriter},
     process::Command,
     sync::{RwLock, mpsc, watch},
+    task::JoinSet,
     time::Instant,
 };
 use toml_edit::DocumentMut;
@@ -274,6 +275,7 @@ struct Artifact {
 
 struct InstanceManager {
     instances: HashMap<String, Arc<Instance>>,
+    tasks: JoinSet<()>,
 }
 
 struct Instance {
@@ -291,12 +293,14 @@ enum InstanceMessage {
     Stop,
     Ping,
     ForkChanged,
+    Deathgasp,
 }
 
 impl InstanceManager {
     async fn new(fork_manager: &'static ForkManager, config: &Config) -> Result<Self> {
         let client = reqwest::Client::new();
         let mut instances = HashMap::new();
+        let mut tasks = JoinSet::new();
         let instances_dir = config.storage_dir.join("instances");
         for (id, instance_conf) in &config.instances {
             let instance_dir = instances_dir.join(id);
@@ -310,7 +314,7 @@ impl InstanceManager {
                 timeout_seconds: instance_conf.timeout_seconds,
                 notifier: send,
             });
-            tokio::spawn(Self::run_instance(
+            tasks.spawn(Self::run_instance(
                 config.notifications.discord_webhook.clone(),
                 fork_manager,
                 config.base_url.clone(),
@@ -322,7 +326,14 @@ impl InstanceManager {
             ));
             instances.insert(id.clone(), instance);
         }
-        Ok(Self { instances })
+        Ok(Self { instances, tasks })
+    }
+
+    async fn die(&mut self) {
+        for instance in self.instances.values() {
+            _ = instance.notifier.send(InstanceMessage::Deathgasp);
+        }
+        while self.tasks.join_next().await.is_some() {}
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -337,7 +348,9 @@ impl InstanceManager {
         mut recv: mpsc::UnboundedReceiver<InstanceMessage>,
     ) {
         loop {
+            let mut deathgasp = false;
             match Self::run_instance_inner(
+                &mut deathgasp,
                 fork_manager,
                 &base_url,
                 &instance_id,
@@ -348,13 +361,18 @@ impl InstanceManager {
             )
             .await
             {
-                Ok(true) => loop {
-                    match recv.recv().await {
-                        Some(InstanceMessage::Restart) => break,
-                        None => return,
-                        _ => (),
+                Ok(true) => {
+                    if deathgasp {
+                        return;
                     }
-                },
+                    loop {
+                        match recv.recv().await {
+                            Some(InstanceMessage::Restart) => break,
+                            None => return,
+                            _ => (),
+                        }
+                    }
+                }
                 Ok(false) => continue,
                 Err(e) => {
                     error!("Restarting instance {instance_id}: {e:?}");
@@ -378,7 +396,9 @@ impl InstanceManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_instance_inner(
+        deathgasp: &mut bool,
         fork_manager: &'static ForkManager,
         base_url: &str,
         instance_id: &str,
@@ -435,6 +455,7 @@ impl InstanceManager {
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum WaitingForExitType {
             None,
+            Delayed,
             Restart,
             Kill,
         }
@@ -469,14 +490,29 @@ impl InstanceManager {
                         );
                     }
                     timeout = Instant::now() + Duration::from_secs(5);
-                    waiting_for_exit = WaitingForExitType::Kill;
+                    waiting_for_exit = WaitingForExitType::Restart;
                 }
                 CommandOrExitOrUpdateOrTimeout::Command(Some(InstanceMessage::Stop)) => {
-                    child.kill().await?;
-                    return Ok(true);
+                    let resp = client
+                        .post(format!("http://localhost:{}/shutdown", instance.port))
+                        .header("WatchdogToken", &internal_token)
+                        .body(r#"{"Reason":"Watchdog shutting down."}"#)
+                        .send()
+                        .await
+                        .and_then(|resp| resp.error_for_status());
+                    if let Err(e) = resp {
+                        warn!(
+                            "Failed to notify shutdown on instance {}: {e:?}",
+                            instance.name
+                        );
+                    }
+                    timeout = Instant::now() + Duration::from_secs(5);
+                    waiting_for_exit = WaitingForExitType::Kill;
                 }
                 CommandOrExitOrUpdateOrTimeout::Command(Some(InstanceMessage::Ping)) => {
-                    if waiting_for_exit != WaitingForExitType::Kill {
+                    if waiting_for_exit == WaitingForExitType::None
+                        || waiting_for_exit == WaitingForExitType::Delayed
+                    {
                         timeout =
                             Instant::now() + Duration::from_secs_f64(instance.timeout_seconds);
                     }
@@ -499,14 +535,36 @@ impl InstanceManager {
                         .get(instance.fork.lock().as_str())
                         .ok_or_eyre("Invalid fork for instance!")?;
                     fork_subscriber = fork.update_subscriber.clone();
-                    waiting_for_exit = WaitingForExitType::Restart;
+                    waiting_for_exit = WaitingForExitType::Delayed;
+                }
+                CommandOrExitOrUpdateOrTimeout::Command(Some(InstanceMessage::Deathgasp)) => {
+                    let resp = client
+                        .post(format!("http://localhost:{}/shutdown", instance.port))
+                        .header("WatchdogToken", &internal_token)
+                        .body(r#"{"Reason":"Watchdog shutting down."}"#)
+                        .send()
+                        .await
+                        .and_then(|resp| resp.error_for_status());
+                    if let Err(e) = resp {
+                        warn!(
+                            "Failed to notify shutdown on instance {}: {e:?}",
+                            instance.name
+                        );
+                    }
+                    timeout = Instant::now() + Duration::from_secs(5);
+                    waiting_for_exit = WaitingForExitType::Kill;
+                    *deathgasp = true;
                 }
                 CommandOrExitOrUpdateOrTimeout::Exit(exit_status) => {
                     let exit_status = exit_status?;
-                    if waiting_for_exit != WaitingForExitType::None {
-                        return Ok(false);
-                    }
-                    return Err(eyre!("Process exited with code {:?}", exit_status.code()));
+                    return match waiting_for_exit {
+                        WaitingForExitType::None => {
+                            Err(eyre!("Process exited with code {:?}", exit_status.code()))
+                        }
+                        WaitingForExitType::Delayed => Ok(false),
+                        WaitingForExitType::Restart => Ok(false),
+                        WaitingForExitType::Kill => Ok(true),
+                    };
                 }
                 CommandOrExitOrUpdateOrTimeout::Update => {
                     let resp = client
@@ -521,7 +579,7 @@ impl InstanceManager {
                             instance.name
                         );
                     }
-                    waiting_for_exit = WaitingForExitType::Restart;
+                    waiting_for_exit = WaitingForExitType::Delayed;
                 }
                 CommandOrExitOrUpdateOrTimeout::Timeout => {
                     child.kill().await?;
@@ -535,7 +593,7 @@ impl InstanceManager {
 #[derive(Clone, Copy)]
 struct AppState {
     fork_manager: &'static ForkManager,
-    instance_manager: &'static InstanceManager,
+    instance_manager: &'static RwLock<InstanceManager>,
     config_file: &'static std::path::Path,
 }
 
@@ -546,6 +604,7 @@ async fn main() -> Result<()> {
     let config_file = tokio::fs::read_to_string(&args.config_file).await?;
     let config: Config = toml_edit::de::from_str(&config_file)?;
     let fork_manager = Box::leak(Box::new(ForkManager::new(&config).await?));
+    let instance_manager = Box::leak(Box::new(RwLock::new(InstanceManager::new(fork_manager, &config).await?)));
     let app = Router::new()
         .route("/server_api/{key}/ping", post(server_ping))
         .route("/instances/{key}/restart", post(server_restart))
@@ -554,14 +613,13 @@ async fn main() -> Result<()> {
         .route("/instances/{key}/update", post(fork_update))
         .with_state(AppState {
             fork_manager,
-            instance_manager: Box::leak(Box::new(
-                InstanceManager::new(fork_manager, &config).await?,
-            )),
+            instance_manager,
             config_file: Box::leak(Box::new(args.config_file)),
         });
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     axum::serve(listener, app).await?;
+    instance_manager.write().await.die().await;
     Ok(())
 }
 
@@ -573,7 +631,7 @@ async fn server_ping(
     if creds.username() != key {
         return Err(StatusCode::FORBIDDEN.into());
     }
-    let Some(instance) = state.instance_manager.instances.get(&key) else {
+    let Some(instance) = state.instance_manager.read().await.instances.get(&key).cloned() else {
         return Err(StatusCode::NOT_FOUND.into());
     };
     if !constant_time_eq(
@@ -597,7 +655,7 @@ async fn server_restart(
     if creds.username() != key {
         return Err(StatusCode::FORBIDDEN.into());
     }
-    let Some(instance) = state.instance_manager.instances.get(&key) else {
+    let Some(instance) = state.instance_manager.read().await.instances.get(&key).cloned() else {
         return Err(StatusCode::NOT_FOUND.into());
     };
     if !constant_time_eq(creds.password().as_bytes(), instance.token.as_bytes()) {
@@ -618,7 +676,7 @@ async fn server_stop(
     if creds.username() != key {
         return Err(StatusCode::FORBIDDEN.into());
     }
-    let Some(instance) = state.instance_manager.instances.get(&key) else {
+    let Some(instance) = state.instance_manager.read().await.instances.get(&key).cloned() else {
         return Err(StatusCode::NOT_FOUND.into());
     };
     if !constant_time_eq(creds.password().as_bytes(), instance.token.as_bytes()) {
@@ -639,7 +697,7 @@ async fn server_set_fork(
     if creds.username() != key {
         return Err(StatusCode::FORBIDDEN.into());
     }
-    let Some(instance) = state.instance_manager.instances.get(&key) else {
+    let Some(instance) = state.instance_manager.read().await.instances.get(&key).cloned() else {
         return Err(StatusCode::NOT_FOUND.into());
     };
     if !constant_time_eq(creds.password().as_bytes(), instance.token.as_bytes()) {
