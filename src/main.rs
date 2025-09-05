@@ -618,7 +618,10 @@ async fn main() -> Result<()> {
         });
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
-    axum::serve(listener, app).await?;
+    tokio::select! {
+        r = axum::serve(listener, app) => r,
+        r = tokio::signal::ctrl_c() => r,
+    }?;
     instance_manager.write().await.die().await;
     Ok(())
 }
