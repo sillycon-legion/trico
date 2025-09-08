@@ -155,6 +155,8 @@ impl ForkManager {
                 while let Some(chunk) = resp.chunk().await? {
                     file.write_all(&chunk).await?;
                 }
+                file.flush().await?;
+                file.into_inner().sync_all().await?;
             }
             let (send, recv) = watch::channel(());
             forks.insert(
@@ -206,6 +208,8 @@ impl ForkManager {
         while let Some(chunk) = resp.chunk().await? {
             file.write_all(&chunk).await?;
         }
+        file.flush().await?;
+        file.into_inner().sync_all().await?;
         *fork.current_hash.write().await = artifact.sha256;
         *fork.current_version.write().await = latest_id.clone();
         drop(path);
